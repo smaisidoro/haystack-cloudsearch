@@ -1,10 +1,10 @@
 
+import json
 import logging
 import time
 
 from django.core.exceptions import ImproperlyConfigured, ValidationError
 from django.db.models.loading import get_model
-from django.utils import simplejson
 
 import haystack
 from haystack.backends import BaseEngine, BaseSearchBackend, BaseSearchQuery
@@ -16,19 +16,25 @@ from haystack.utils import get_identifier
 from haystack_cloudsearch.cloudsearch_utils import (ID, DJANGO_CT, DJANGO_ID,
                                                     gen_version,
                                                     botobool)
-try:
-    import boto
-except ImportError:
-    raise MissingDependency("The 'cloudsearch' backend requires the installation of 'boto'. Please refer to the documentation.")
 
 try:
-    from boto.cloudsearch import CloudsearchProcessingException, CloudsearchNeedsIndexingException
+    import boto
+    from boto import cloudsearch2
+    from boto.cloudsearch2.domain import Domain
 except ImportError:
-    raise MissingDependency("The 'cloudsearch' backend requires an installation of 'boto' from the cloudsearch branch at https://github.com/pbs/boto")
+    raise MissingDependency("The 'cloudsearch' backend requires the installation of 'boto'. Please refer to the documentation.")
 
 
 class CloudsearchDryerExploded(Exception):
     """ This is raised when the max timeout for a spinlock is encountered. """
+    pass
+
+
+class CloudsearchProcessingException(Exception):
+    pass
+
+
+class CloudsearchNeedsIndexingException(Exception):
     pass
 
 
@@ -46,13 +52,13 @@ class CloudsearchSearchBackend(BaseSearchBackend):
         # We want to check if there is a 'REGION' passed into the connection. If there is we validate it with the
         # available regions.
         region_name = connection_options.get('REGION', None)
-        region_list = [cloudsearch_region.name for cloudsearch_region in boto.cloudsearch.regions()]
+        region_list = [cloudsearch_region.name for cloudsearch_region in cloudsearch2.regions()]
         region_conn = None
 
         if region_name and region_name not in region_list:
             raise ImproperlyConfigured("The 'REGION' in your connection settings is not valid. Available regions are %s" % region_list)
         elif region_name:
-            for region in boto.cloudsearch.regions():
+            for region in cloudsearch2.regions():
                 if region.name == region_name:
                     region_conn = region
                     break
@@ -69,10 +75,11 @@ class CloudsearchSearchBackend(BaseSearchBackend):
         if self.ip_address is None:
             raise ImproperlyConfigured("You must specify IP_ADDRESS in your settings for connection '%s'." % connection_alias)
 
-        self.boto_conn = boto.connect_cloudsearch(
+        self.boto_conn = boto.connect_cloudsearch2(
             aws_access_key_id=connection_options['AWS_ACCESS_KEY_ID'],
             aws_secret_access_key=connection_options['AWS_SECRET_KEY'],
-            region=region_conn
+            region=region_conn,
+            sign_request=True
         )
 
         # this will become a standard haystack logger down the line
@@ -81,7 +88,7 @@ class CloudsearchSearchBackend(BaseSearchBackend):
 
     def get_domain(self, index):
         """ Given a SearchIndex, return a boto Domain object """
-        return self.boto_conn.get_domain(self.get_searchdomain_name(index))
+        return self.boto_conn.lookup(self.get_searchdomain_name(index))
 
     def enable_index_access(self, index, ip_address):
         """ given an index and an ip_address to enable, enable searching and document services """
@@ -90,7 +97,7 @@ class CloudsearchSearchBackend(BaseSearchBackend):
     def enable_domain_access(self, search_domain, ip_address):
         """ takes the cloudsearch search_domain name  and an ip_address to enable searching and doc services for
         """
-        domain = self.boto_conn.get_domain(search_domain)
+        domain = self.boto_conn.lookup(search_domain)
         if domain is None:
             raise Exception('Unable to enable SearchDomain %s because %s was not found.' % (search_domain, search_domain))
         policy = domain.get_access_policies()
@@ -146,48 +153,46 @@ class CloudsearchSearchBackend(BaseSearchBackend):
                 self.log.critical("Generated SearchDomain name, '%s', for index, '%s', failed validation constraints." % (
                     search_domain_name, index))
                 raise
-            domain = self.boto_conn.get_domain(search_domain_name)
+            domain = self.boto_conn.lookup(search_domain_name)
             should_build_schema = False
             if domain is None:
-                domain = self.boto_conn.create_domain(search_domain_name)
+                self.boto_conn.layer1.create_domain(search_domain_name)
+                domain = self.boto_conn.lookup(search_domain_name)
                 self.setup_complete = False
                 should_build_schema = True
-            description = self.boto_conn.layer1.describe_index_fields(search_domain_name)
+            schema = self.boto_conn.layer1.describe_index_fields(search_domain_name)['DescribeIndexFieldsResponse']['DescribeIndexFieldsResult']['IndexFields']
             ideal_schema = self.build_schema(index.fields)
             if not should_build_schema:
-                # load the schema as a python data type to compare to the idealized schema
-                schema = simplejson.loads(simplejson.dumps([d['options'] for d in description]))
-                key = lambda x: x[u'index_field_name']
-                if [x for x in sorted(schema, key=key)] != [x for x in sorted(ideal_schema, key=key)]:
+                key = lambda x: x[u'Options'][u'IndexFieldName']
+                if sorted(schema, key=key) != sorted(ideal_schema, key=key):
                     self.setup_complete = False
                     should_build_schema = True
 
             # This currently only will handle the create use case
             if should_build_schema and not self.setup_complete:
                 for field in ideal_schema:
-                    field_type = field[u'index_field_type']
+                    field_options = field[u'Options']
+                    field_type = field_options[u'IndexFieldType']
 
-                    args = {'domain_name': search_domain_name,
-                            'field_name': field[u'index_field_name'],
+                    args = {'field_name': field_options[u'IndexFieldName'],
                             'field_type': field_type}
 
                     if field_type == 'uint':
-                        default = field[u'u_int_options'][u'default_value']
+                        default = field_options[u'IntOptions'][u'DefaultValue']
 
                     elif field_type == 'text':
-                        default = field[u'text_options'][u'default_value']
-                        args['facet'] = field[u'text_options'][u'facet_enabled']
-                        args['result'] = field[u'text_options'][u'result_enabled']
+                        default = field_options[u'TextOptions'][u'DefaultValue']
+                        args['facet'] = field_options[u'TextOptions'][u'FacetEnabled']
 
                     elif field_type == 'literal':
-                        default = field[u'literal_options'][u'default_value']
-                        args['facet'] = field[u'literal_options'][u'facet_enabled']
-                        args['result'] = field[u'literal_options'][u'result_enabled']
-                        args['searchable'] = field[u'literal_options']['search_enabled']
+                        default = field_options[u'LiteralOptions'][u'DefaultValue']
+                        args['facet'] = field_options[u'LiteralOptions'][u'FacetEnabled']
+                        args['searchable'] = field_options[u'LiteralOptions'][u'SearchEnabled']
 
                     if default is not None:
                         args['default'] = default
-                    self.boto_conn.layer1.define_index_field(**args)
+
+                    domain.create_index_field(**args)
 
         self.setup_complete = True  # should be True when finished
 
@@ -199,56 +204,60 @@ class CloudsearchSearchBackend(BaseSearchBackend):
         """ return a dictionary describing the schema """
 
         results = []
-        for name, field in fields.iteritems():
-            d = {}
-            default_value = (u'%s' % (field._default,)) if field.has_default() else {}
-            default_value = {}
-            if field.has_default():
-                tmp = field._default
-                if type(tmp) is list:
-                    if len(tmp) != 1:
-                        self.log.critical("Field '%s' of type '%s' is a multivalue field with more than one default. Values outside the first will be truncated!" % (
-                            name, type(field)))
-                    tmp = tmp[0]
-                default_value = u'%s' % (tmp,)
-            try:
-                field_type = self.get_field_type(field)
-            except KeyError:
-                # This needs to be a real exception
-                raise Exception('CloudsearchSearchBackend only supports CharField, UnsignedIntegerField, and LiteralField plus Facet- and MultiValue- variations of these.')
-            d[u'index_field_name'] = unicode(field.index_fieldname)
-            try:
-                self.validate_index_field_name(d[u'index_field_name'])
-            except ValidationError:
-                self.log.critical("Attempted to build schema with an invalid field index name: '%s'." % (d[u'index_field_name'],))
-                raise
-            d[u'index_field_type'] = field_type
-            options = {u'default_value': default_value}
-            if field_type == u'uint':
-                d[u'u_int_options'] = options
-            elif field_type == u'text':
-                options[u'facet_enabled'] = botobool(field.faceted)
-                options[u'result_enabled'] = botobool(field.stored)
-                d[u'text_options'] = options
-            elif field_type == u'literal':
-                options[u'facet_enabled'] = botobool(field.faceted)
-                options[u'result_enabled'] = botobool(field.stored)
-                options[u'search_enabled'] = botobool(field.indexed)
-                d[u'literal_options'] = options
-            if field.stored and field.faceted:
-                raise Exception("Fields must either be faceted or stored, not both.")  # TODO: make this exception named
-            results.append(d)
-
+        # import pdb;pdb.set_trace()
+        # for name, field in fields.iteritems():
+        #     d = {}
+        #     # default_value = (u'%s' % (field._default,)) if field.has_default() else {}
+        #     default_value = {}
+        #     if field.has_default():
+        #         tmp = field._default
+        #         if type(tmp) is list:
+        #             if len(tmp) != 1:
+        #                 self.log.critical("Field '%s' of type '%s' is a multivalue field with more than one default. Values outside the first will be truncated!" % (
+        #                     name, type(field)))
+        #             tmp = tmp[0]
+        #         default_value = u'%s' % (tmp,)
+        #     try:
+        #         field_type = self.get_field_type(field)
+        #     except KeyError:
+        #         # This needs to be a real exception
+        #         raise Exception('CloudsearchSearchBackend only supports CharField, UnsignedIntegerField, and LiteralField plus Facet- and MultiValue- variations of these.')
+        #     d[u'IndexFieldName'] = unicode(field.index_fieldname)
+        #     try:
+        #         self.validate_index_field_name(d[u'IndexFieldName'])
+        #     except ValidationError:
+        #         self.log.critical("Attempted to build schema with an invalid field index name: '%s'." % (d[u'IndexFieldName'],))
+        #         raise
+        #     d[u'IndexFieldType'] = field_type
+        #     options = {u'DefaultValue': default_value}
+        #     if field_type == u'uint':
+        #         d[u'IntOptions'] = options
+        #     elif field_type == u'text':
+        #         options[u'FacetEnabled'] = botobool(field.faceted)
+        #         d[u'TextOptions'] = options
+        #     elif field_type == u'literal':
+        #         options[u'FacetEnabled'] = botobool(field.faceted)
+        #         options[u'SearchEnabled'] = botobool(field.indexed)
+        #         d[u'LiteralOptions'] = options
+        #     if field.stored and field.faceted:
+        #         raise Exception("Fields must either be faceted or stored, not both.")  # TODO: make this exception named
+        #     results.append(d)
+        # import pdb;pdb.set_trace()
         # haystack expects these to be able to map a result onto a model
+
+        # FIXME Faceting is deprecated here, due to Hack!
+        # All indexes are now literal.
+
         for field in (DJANGO_ID, DJANGO_CT, ID):
             results.append({
-                u'index_field_name': u'%s' % (field,),
-                u'index_field_type': u'literal',
-                u'literal_options': {
-                    u'default_value': {},
-                    u'facet_enabled': 'false',
-                    u'result_enabled': 'true',
-                    u'search_enabled': 'false'}})
+                u'Options': {
+                    u'IndexFieldName': u'%s' % (field,),
+                    u'IndexFieldType': u'literal',
+                    u'LiteralOptions': {
+                        u'DefaultValue': {},
+                        u'FacetEnabled': 'false',
+                        u'SearchEnabled': 'false'}}
+                })
         return results
 
     def get_index_for_obj(self, obj):
@@ -312,7 +321,7 @@ class CloudsearchSearchBackend(BaseSearchBackend):
         # this needs some help in terms of generating an id
         for obj in prepped_objs:
             obj['id'] = obj['id'].replace('.', '__')
-            doc_service.add(obj['id'], gen_version(obj), obj)
+            doc_service.add(obj['id'], obj)
         # this can fail if the upload is too large;
         # there should be some error handling around this
         doc_service.commit()
@@ -351,7 +360,7 @@ class CloudsearchSearchBackend(BaseSearchBackend):
                 domains.append(self.get_searchdomain_name(i))
 
         if models is None and indexes is None and not domains:
-            domains = [x['domain_name'] for x in self.boto_conn.layer1.describe_domains()]
+            domains = [x for x in self.boto_conn.layer1.describe_domains()['DescribeDomainsResponse']['DescribeDomainsResult']]
             if not everything:
                 conn = haystack.connections[self.connection_alias]
                 unified_index = conn.get_unified_index()
@@ -361,7 +370,6 @@ class CloudsearchSearchBackend(BaseSearchBackend):
         self.log.debug('deleting domains: %s' % (', '.join(domains),))
         for d in domains:
             self.boto_conn.layer1.delete_domain(d)
-
         if spinlock:
             if self.domain_processing_spinlock(domains):
                 if commit:
@@ -389,7 +397,7 @@ class CloudsearchSearchBackend(BaseSearchBackend):
         return False
 
     def domain_processing_spinlock(self, domains):
-        return self.spinlock(lambda: not filter(None, map(self.boto_conn.get_domain, domains)), CloudsearchProcessingException, 'domain processing')
+        return self.spinlock(lambda: not filter(None, map(self.boto_conn.lookup, domains)), CloudsearchProcessingException, 'domain processing')
 
     def search(self, query_string, **kwargs):
         """ Blended search across all SearchIndexes.
